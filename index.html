@@ -63,6 +63,7 @@ label{display:block;font-weight:700;font-size:14px;margin:12px 0 5px}
 .btn.bad{background:var(--bad);color:#1a0008;box-shadow:none}.btn.ok{background:var(--ok);color:#00170d;box-shadow:none}.btn.sm{padding:7px 13px;font-size:13px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.row>*{flex:1}.row .btn,.row .tag{flex:none}
 .box{background:var(--glass);border:1px solid var(--bd);border-radius:16px;padding:14px;margin-bottom:12px}
+.claim{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap;border-color:rgba(251,191,36,.45);background:linear-gradient(135deg,rgba(251,191,36,.12),rgba(139,92,246,.1))}
 .tag{display:inline-block;padding:2px 11px;border-radius:99px;font-size:12px;font-weight:700;background:rgba(139,92,246,.18);color:#c4b5fd;border:1px solid rgba(139,92,246,.35)}
 .tag.g{background:rgba(52,211,153,.12);color:var(--ok);border-color:rgba(52,211,153,.35)}.tag.r{background:rgba(251,113,133,.12);color:var(--bad);border-color:rgba(251,113,133,.35)}.tag.y{background:rgba(251,191,36,.12);color:var(--a);border-color:rgba(251,191,36,.35)}
 .mut{color:var(--mut);font-size:13px}.ttl{font-weight:800;font-size:20px;margin:4px 0 12px}
@@ -104,7 +105,7 @@ a{color:var(--c)}.empty{text-align:center;color:var(--mut);padding:44px 10px}
 <script>
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const S={token:localStorage.getItem('sf_token')||'',user:null,admin:false,cfg:{},products:[],loaded:false,cat:'all',q:'',view:'store',atab:'summary',pimgs:[],newPids:[],star:5};
+const S={token:localStorage.getItem('sf_token')||'',user:null,admin:false,cfg:{},products:[],loaded:false,cat:'all',q:'',view:'store',atab:'summary',pimgs:[],newPids:[],star:5,claim:null};
 const GOV=['بغداد','البصرة','نينوى','أربيل','السليمانية','دهوك','كركوك','الأنبار','ديالى','صلاح الدين','بابل','كربلاء','النجف','الديوانية','واسط','ميسان','ذي قار','المثنى'];
 const ST={paid:['مدفوع - بانتظار التجهيز','y'],processing:['قيد التجهيز',''],shipped:['في الطريق إليك',''],delivered:['تم التسليم','g'],refunded:['تم الاسترجاع','r']};
 const RF={requested:['طلب الاسترجاع قيد المراجعة','y'],processing:['جارٍ تحويل المبلغ','y'],rejected:['رُفض طلب الاسترجاع','r'],refunded:['أُعيد المبلغ إلى محفظتك','g']};
@@ -124,8 +125,8 @@ function closeModal(){if(S.onClose){const f=S.onClose;S.onClose=null;f()}$('#mod
 
 /* ---------- الدخول ---------- */
 function onIncomplete(p){fetch('/api/payments/incomplete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({payment:p})}).catch(()=>{})}
-function setSession(d){S.token=d.token;S.user=d.user||{username:'admin'};S.admin=!!d.admin;localStorage.setItem('sf_token',d.token);localStorage.setItem('sf_admin',d.admin?'1':'');chrome()}
-function logout(){S.token='';S.user=null;S.admin=false;localStorage.removeItem('sf_token');localStorage.removeItem('sf_admin');S.view='store';chrome();render()}
+function setSession(d){S.token=d.token;S.user=d.user||{username:'admin'};S.admin=!!d.admin;localStorage.setItem('sf_token',d.token);localStorage.setItem('sf_admin',d.admin?'1':'');chrome();loadClaim()}
+function logout(){S.token='';S.user=null;S.admin=false;S.claim=null;localStorage.removeItem('sf_token');localStorage.removeItem('sf_admin');S.view='store';chrome();render()}
 async function piLogin(){
   if(!window.Pi){toast('افتح التطبيق من متصفح Pi للدفع وتسجيل الدخول');return false}
   try{
@@ -138,6 +139,30 @@ async function piLogin(){
 function adminLogin(){openModal(`<div class="ttl">دخول الإدارة</div><label>كلمة المرور</label><input type="password" id="ap" onkeydown="if(event.key==='Enter')doAdminLogin()"><br><br><button class="btn" style="width:100%" onclick="doAdminLogin()">دخول</button>`)}
 async function doAdminLogin(){try{const d=await api('/api/admin/login','POST',{password:$('#ap').value});setSession(d);closeModal();go('admin')}catch(e){toast(e.message)}}
 
+/* ---------- هدية الترحيب ---------- */
+async function loadClaim(){
+  if(!S.user||!S.user.uid||S.admin){S.claim=null;return}
+  try{S.claim=await api('/api/claim/status')}catch(e){S.claim=null}
+  if(S.view==='store'&&S.loaded)renderStore();
+}
+const claimHtml=()=>{
+  if(!S.cfg.claimEnabled||S.admin||(S.claim&&S.claim.claimed))return '';
+  const a=S.cfg.claimAmount||0.1;
+  return `<div class="box claim"><div><b>🎁 هدية ترحيبية: <span class="num">${a}</span> π مجاناً</b><div class="mut">تُرسل مباشرة إلى محفظة Pi الخاصة بك، مرة واحدة لكل حساب.</div></div>${S.user?`<button class="btn" id="claimbtn" onclick="claimReward(this)">استلم ${a} π</button>`:`<button class="btn" onclick="piLogin()">ربط المحفظة والاستلام</button>`}</div>`;
+};
+async function claimReward(btn){
+  btn.disabled=true;btn.textContent='جارٍ الإرسال...';
+  try{
+    const d=await api('/api/claim','POST');
+    S.claim={...(S.claim||{}),claimed:true};
+    toast('تم إرسال '+d.amount+' π إلى محفظتك ✓');
+    renderStore();
+  }catch(e){
+    toast(e.message);
+    btn.disabled=false;btn.textContent='استلم '+(S.cfg.claimAmount||0.1)+' π';
+  }
+}
+
 /* ---------- الهيكل ---------- */
 function chrome(){
   $('#who').innerHTML=S.user?`<span class="wallet num">π ${esc(S.user.username)}</span><button class="btn sm sec" onclick="logout()">خروج</button>`:`<button class="btn sm" onclick="piLogin()">ربط محفظة Pi</button>`;
@@ -149,10 +174,10 @@ function render(){({store:renderStore,orders:renderOrders,admin:renderAdmin})[S.
 
 /* ---------- المتجر ---------- */
 async function renderStore(){
-  if(!S.loaded){$('#main').innerHTML=heroHtml()+'<div class="grid">'+'<div class="skel"></div>'.repeat(4)+'</div>';S.products=await api('/api/products').catch(()=>[]);S.loaded=true;if(S.view!=='store')return}
+  if(!S.loaded){$('#main').innerHTML=heroHtml()+claimHtml()+'<div class="grid">'+'<div class="skel"></div>'.repeat(4)+'</div>';S.products=await api('/api/products').catch(()=>[]);S.loaded=true;if(S.view!=='store')return}
   const cats=['all',...new Set(S.products.map(p=>p.category))];
   const list=S.products.filter(p=>(S.cat==='all'||p.category===S.cat)&&(!S.q||(p.name+' '+p.description).toLowerCase().includes(S.q.toLowerCase())));
-  $('#main').innerHTML=heroHtml()+`<input id="q" placeholder="ابحث عن هاتف أو إكسسوار..." value="${esc(S.q)}" oninput="onSearch(this.value)" style="margin-bottom:12px">
+  $('#main').innerHTML=heroHtml()+claimHtml()+`<input id="q" placeholder="ابحث عن هاتف أو إكسسوار..." value="${esc(S.q)}" oninput="onSearch(this.value)" style="margin-bottom:12px">
   <div class="chips">${cats.map((c,i)=>`<button class="chip ${S.cat===c?'on':''}" data-c="${esc(c)}" onclick="S.cat=this.dataset.c;renderStore()">${c==='all'?'الكل':esc(c)}</button>`).join('')}</div>
   ${list.length?`<div class="grid">${list.map(card).join('')}</div>`:'<div class="empty">لا توجد منتجات مطابقة</div>'}
   <p class="mut" style="margin-top:30px;text-align:center">${S.cfg.shopPhone?`للتواصل: <a href="tel:${esc(S.cfg.shopPhone)}" class="num">${esc(S.cfg.shopPhone)}</a> · `:''}<a href="/privacy">الخصوصية</a> · <a href="/terms">الشروط</a> · <a href="#" onclick="adminLogin();return false">دخول الإدارة</a></p>`;
