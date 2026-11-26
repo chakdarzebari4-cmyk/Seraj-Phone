@@ -8,6 +8,8 @@
  *  CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET
  *  PI_API_KEY, APP_WALLET_SEED, PI_SANDBOX (true/false)
  *  ADMIN_PASSWORD, ADMIN_PI_USERNAMES (اختياري), SESSION_SECRET
+ *  CLAIM_ENABLED (اختياري، الافتراضي true) - تفعيل هدية الترحيب
+ *  CLAIM_AMOUNT  (اختياري، الافتراضي 0.1)  - مبلغ الهدية بعملة Pi
  */
 const express = require('express');
 const crypto = require('crypto');
@@ -31,6 +33,8 @@ const CLOUD = process.env.CLOUDINARY_CLOUD_NAME || '';
 const CK = process.env.CLOUDINARY_API_KEY || '';
 const CS = process.env.CLOUDINARY_API_SECRET || '';
 const FOLDER = 'sirajphone';
+const CLAIM_ENABLED = String(process.env.CLAIM_ENABLED || 'true') !== 'false';
+const CLAIM_AMOUNT = (() => { const n = Number(process.env.CLAIM_AMOUNT); return n > 0 ? Math.round(n * 1e7) / 1e7 : 0.1; })();
 if (!process.env.SESSION_SECRET) console.warn('تنبيه: SESSION_SECRET غير مضبوط');
 
 /* ---------- Firebase ---------- */
@@ -109,7 +113,7 @@ app.get('/healthz', (req, res) => res.send('ok'));
 app.get('/privacy', (req, res) => res.sendFile(path.join(__dirname, 'privacy.html')));
 app.get('/terms', (req, res) => res.sendFile(path.join(__dirname, 'terms.html')));
 
-app.get('/api/config', (req, res) => res.json({ sandbox: SANDBOX, shop: 'سراج فون', ...settings }));
+app.get('/api/config', (req, res) => res.json({ sandbox: SANDBOX, shop: 'سراج فون', claimEnabled: CLAIM_ENABLED, claimAmount: CLAIM_AMOUNT, ...settings }));
 
 app.post('/api/login', ah(async (req, res) => {
   const { accessToken } = req.body || {};
@@ -318,6 +322,7 @@ app.post('/api/payments/incomplete', ah(async (req, res) => {
   if (!id) throw fail(400, 'identifier مفقود');
   const pay = await pi('/payments/' + encodeURIComponent(id)); const st = pay.status || {};
   if (st.developer_completed) return res.json({ ok: true });
+  if ((pay.metadata || {}).type === 'claim') return res.json({ ok: true }); // دفعات الهدية يعالجها مسار /api/claim
   if ((pay.transaction || {}).txid) await finalizePayment(id, pay.transaction.txid);
   else if (!st.cancelled && !st.user_cancelled) {
     await pi(`/payments/${id}/cancel`, { method: 'POST' }).catch(() => {});
@@ -354,6 +359,62 @@ async function processRefund(o) {
     o.status = 'refunded'; o.history.push({ s: 'refunded', t: now() }); await saveOrder(o);
   } catch (e) { r.status = 'requested'; r.lastError = e.message; await saveOrder(o); throw e; }
 }
+
+/* ---------- هدية الترحيب: إرسال CLAIM_AMOUNT π لكل مستخدم مرة واحدة (تطبيق → مستخدم) ---------- */
+const claimRef = uid => col('claims').doc(String(uid));
+
+async function payUser(ref, c) {
+  let pay = null;
+  if (c.paymentId) {
+    pay = await pi('/payments/' + encodeURIComponent(c.paymentId));
+    const st = pay.status || {};
+    if (st.cancelled || st.user_cancelled) pay = null; // دفعة ملغاة: ننشئ واحدة جديدة
+  }
+  if (!pay) {
+    pay = await pi('/payments', { method: 'POST', body: { payment: { amount: c.amount, memo: 'هدية ترحيبية - سراج فون', metadata: { type: 'claim', uid: c.uid }, uid: c.uid } } });
+    await ref.update({ paymentId: pay.identifier });
+  }
+  let txid = (pay.transaction || {}).txid;
+  if (!txid) {
+    const kp = StellarSdk.Keypair.fromSecret(APP_WALLET_SEED);
+    const server = new StellarSdk.Horizon.Server(HORIZON);
+    const acc = await server.loadAccount(kp.publicKey());
+    const fee = await server.fetchBaseFee();
+    const tx = new StellarSdk.TransactionBuilder(acc, { fee: String(fee), networkPassphrase: NET_PASS, timebounds: await server.fetchTimebounds(180) })
+      .addOperation(StellarSdk.Operation.payment({ destination: pay.to_address, asset: StellarSdk.Asset.native(), amount: String(pay.amount) }))
+      .addMemo(StellarSdk.Memo.text(pay.identifier)).build();
+    tx.sign(kp);
+    const result = await server.submitTransaction(tx); txid = result.hash || result.id;
+  }
+  if (!(pay.status || {}).developer_completed) await pi(`/payments/${pay.identifier}/complete`, { method: 'POST', body: { txid } });
+  return txid;
+}
+
+app.get('/api/claim/status', needUser, ah(async (req, res) => {
+  const d = await claimRef(req.auth.uid).get();
+  res.json({ enabled: CLAIM_ENABLED, amount: CLAIM_AMOUNT, claimed: d.exists && d.data().status === 'done' });
+}));
+app.post('/api/claim', needUser, ah(async (req, res) => {
+  if (!CLAIM_ENABLED) throw fail(400, 'الهدية غير مفعّلة حالياً');
+  if (!PI_API_KEY || !APP_WALLET_SEED) throw fail(500, 'يجب ضبط PI_API_KEY و APP_WALLET_SEED');
+  const uid = req.auth.uid, ref = claimRef(uid);
+  // حجز ذري: يمنع الاستلام المزدوج حتى لو ضغط المستخدم الزر مرتين
+  const c = await fdb.runTransaction(async t => {
+    const s = await t.get(ref); const cur = s.exists ? s.data() : null;
+    if (cur && cur.status === 'done') throw fail(400, 'لقد استلمت الهدية مسبقاً');
+    if (cur && cur.status === 'processing' && now() - (cur.updatedAt || 0) < 5 * 60 * 1000) throw fail(400, 'جارٍ إرسال المبلغ، انتظر قليلاً');
+    const next = { ...(cur || {}), uid, username: req.auth.username, amount: CLAIM_AMOUNT, status: 'processing', createdAt: (cur && cur.createdAt) || now(), updatedAt: now() };
+    t.set(ref, next); return next;
+  });
+  try {
+    const txid = await payUser(ref, c);
+    await ref.update({ status: 'done', txid, claimedAt: now(), updatedAt: now(), lastError: null });
+    res.json({ ok: true, amount: c.amount, txid });
+  } catch (e) {
+    await ref.update({ status: 'failed', lastError: e.message, updatedAt: now() }).catch(() => {});
+    throw e;
+  }
+}));
 
 /* ---------- لوحة الإدارة ---------- */
 const recentOrders = () => listDocs(col('orders').orderBy('createdAt', 'desc').limit(300)).then(l => l.filter(o => !['pending_payment', 'cancelled'].includes(o.status)));
